@@ -1,7 +1,9 @@
 use crate::config::Config;
 use aws_config::SdkConfig;
+use aws_sdk_sso::error::SdkError;
 use aws_sdk_ssooidc::operation::{
-    create_token::CreateTokenOutput, register_client::RegisterClientOutput,
+    create_token::{CreateTokenError, CreateTokenOutput},
+    register_client::RegisterClientOutput,
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -111,7 +113,7 @@ impl SSOSession {
         self.registration_expires_at = Some(registration_expires_at);
     }
 
-    pub async fn refresh_token(&mut self, aws_config: &SdkConfig) {
+    pub async fn refresh_token(&mut self, aws_config: &SdkConfig) -> Result<(), ()> {
         let (token, _expires) = self
             .credentials
             .as_ref()
@@ -121,9 +123,10 @@ impl SSOSession {
                 self.client_id.as_deref().unwrap(),
                 self.client_secret.as_deref().unwrap(),
             )
-            .await;
+            .await.or(Err(()))?;
         // self.registration_expires_at = Some(expires);
         self.credentials = Some(token);
+        Ok(())
     }
 
     pub fn merge_from_cache(mut self, cache: SSOSession) -> Self {
@@ -205,7 +208,7 @@ impl SSOToken {
         aws_config: &SdkConfig,
         client_id: &str,
         client_secret: &str,
-    ) -> (SSOToken, DateTime<Utc>) {
+    ) -> Result<(SSOToken, DateTime<Utc>), SdkError<CreateTokenError>> {
         SSOTokenBuilder::new(aws_config, None, None, None)
             .refresh_token(
                 client_id,
@@ -287,7 +290,10 @@ impl<'a> SSOTokenBuilder<'a> {
             .unwrap()
     }
 
-    async fn refresh(&self, client: &aws_sdk_ssooidc::Client) -> CreateTokenOutput {
+    async fn refresh(
+        &self,
+        client: &aws_sdk_ssooidc::Client,
+    ) -> Result<CreateTokenOutput, SdkError<CreateTokenError>> {
         println!("Refreshing token");
         let refresh_token = self.refresh_token.expect("refresh_token is not set");
         let client_id = self.client_id.expect("client_id is not set");
@@ -301,7 +307,6 @@ impl<'a> SSOTokenBuilder<'a> {
             .refresh_token(refresh_token)
             .send()
             .await
-            .unwrap()
     }
 
     async fn device_auth(&self, client: &aws_sdk_ssooidc::Client) -> CreateTokenOutput {
@@ -374,16 +379,16 @@ impl<'a> SSOTokenBuilder<'a> {
         client_id: &str,
         client_secret: &str,
         refresh_token: &str,
-    ) -> (SSOToken, DateTime<Utc>) {
+    ) -> Result<(SSOToken, DateTime<Utc>), SdkError<CreateTokenError>> {
         let client = aws_sdk_ssooidc::Client::new(self.aws_config);
         let token = self
             .set_client_id(client_id)
             .set_client_secret(client_secret)
             .set_refresh_token(refresh_token)
             .refresh(&client)
-            .await;
+            .await?;
         let expires = Utc::now().add(Duration::seconds(token.expires_in() as i64));
-        (SSOToken::from(token), expires)
+        Ok((SSOToken::from(token), expires))
     }
 }
 
@@ -406,7 +411,10 @@ impl SSO {
         if session.is_expired() {
             session.create_token(&aws_config).await;
         } else {
-            session.refresh_token(&aws_config).await;
+            if session.refresh_token(&aws_config).await.is_err() {
+                // create a new token if refresh failed 
+                session.create_token(&aws_config).await;
+            }
         }
         let _ = self.config.write_sso_cache(sso_session_name, &session);
 
